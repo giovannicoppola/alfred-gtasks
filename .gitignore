@@ -1,0 +1,14 @@
+.DS_Store
+*.pyc
+__pycache__
+prefs.plist
+lib
+sandbox
+
+# secrets / OAuth — never commit
+token.json
+_token.json
+credentials.json
+*token*.json
+*credentials*.json
+client_secret*.json
