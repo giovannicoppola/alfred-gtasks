@@ -1,81 +1,67 @@
-# alfred-gsheets
- 
+# alfred-gTasks ✅
 
-Inspired by `I-sheet-you-not`, this Workflow creates new Workflows to access individual Google Sheets with Alfred.
+An [Alfred](https://www.alfredapp.com/) workflow to create and manage your **Google Tasks**
+— add a task (with a natural-language due date), then browse, complete, or delete your tasks,
+without leaving Alfred.
 
-![](images/gsheets.gif)
-
-<a href="https://github.com/giovannicoppola/alfred-gsheets/releases/latest/">
+<a href="https://github.com/giovannicoppola/alfred-gTasks/releases/latest/">
 <img alt="Downloads"
-src="https://img.shields.io/github/downloads/giovannicoppola/alfred-gsheets/total?color=purple&label=Downloads"><br/>
+src="https://img.shields.io/github/downloads/giovannicoppola/alfred-gTasks/total?color=purple&label=Downloads"><br/>
 </a>
 
-## 🚀Usage
-1. Open a Google Sheet in your browser. 
-2. Launch `alfred-gsheets` via keyword (default: `gshe`) or hotkey
-3. `alfred-gsheets` will check the frontmost page with one of three outcomes:
-	1. The website is not a Google Sheet ▶️ check URL
-	2. The website is a Google Sheet but you don't have the right permissions ▶️ review the `Setting up` section
-	3. The website is a Google Sheet and you have at least viewing privileges ▶️ go to step 4
-4. `alfred-gsheets` will list the individual worksheets. Select one to generate a `alfred-gsheets` Workflow instance to browse that Sheet. 
-5. Once a new Workflow is created, ↩️ will lead you to its `Workflow Configuration`, where changes to keyword etc. can be made:
-- `Header Row` (column headers). Row containing the column headers. Set this to 0 if no header.
-- columns for Alfred's `Title` (required), `Subtitle` and `Arg`. 
- 	- Alternatively, a custom layout can be set as follows: up to three lines (for Title, Subtitle, and Arg), with layout text in quotes and column numbers in square brackets. For example:
+## 🚀 Usage
+
+### Create a task — `gt_new`
+Type the keyword `gt_new` (or a hotkey) followed by the task title and, optionally, a due date:
 
 ```
-Title: "College 🎓: [1]"
-Subtitle: "City: [2]"
-Arg: "URL: [3]"
+gt_new Call the plumber tomorrow
+gt_new Submit report next friday
+gt_new Pay rent in 3 days
+gt_new Dentist 12/15
 ```
 
-- *Note:* if a custom layout is used, the Title, Subtitle and Arg fields will be ignored. 
-- `Append column`: If you have writing privileges on your Google Sheet (see `Setting up`), you can indicate a column to which append values via `alfred-gsheets` using a keyword (default: `[main workflow keyword]::append`, e.g. `uni::append`) or hotkey
+The due date is parsed out of the title, so the task is saved as *"Call the plumber"* due
+tomorrow. Recognised date expressions include:
 
-### 🧮 New workflow: usage
-- entering the main keyword (default: first three letters of the workflow name) will list sheet columns according to the Title, Subtitle, and Arg variables, or custom layout. 
-- If the argument is a URL, `Enter` ↩️ will open it in your browser. 
-- If not, `Enter` ↩️ will copy it to the clipboard
+- `today`, `tomorrow`
+- `next <weekday>` (e.g. `next monday`)
+- `in N days`
+- explicit dates like `12/15` (optionally with a time)
 
+If no date is recognised, the task is created with no due date.
 
- 
+### Browse / complete / delete — `gt_tasks`
+Type `gt_tasks` to list your open tasks. From the list you can mark a task **complete** or
+**delete** it (see the modifier subtitles in Alfred).
 
-## Setting up ⚙️
-*Note: this setup is more complex than the average workflow. I tried to document all the steps below, feel free to point to unclear steps or instructions. A screencast of the process is [here](https://github.com/giovannicoppola/alfred-gsheets/blob/main/images/googleAPIsetup.gif).*
+> Google Tasks stores only the calendar **date** of a due date (the time is ignored). The
+> workflow saves the date so it is preserved in every timezone.
 
-Steps 1-7 are needed to access public Google Sheets. An additional step 8 is needed to access private Google Sheets. 
+## ⚙️ Setting up
 
+This workflow talks to the Google Tasks API on your behalf, so it needs a Google OAuth
+**client credentials** file (this is free).
 
-### Setting up Google Sheets API credentials (required):
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create (or reuse) a
+   project and **enable the Google Tasks API**.
+2. Under **APIs & Services → Credentials**, create an **OAuth client ID** of type
+   *Desktop app*, and download the JSON.
+3. In the workflow's **Configuration** panel, set `KEYFILE` to the path of that downloaded
+   JSON (it is copied in as `credentials.json`).
+4. The first time you create a task, a browser window opens to authorise access. After you
+   approve, a `token.json` is stored inside the workflow so you won't be asked again.
 
-1. Log into your Google account
-1. Go to the [Google Developers Console](https://console.developers.google.com/)
-1. Using the `Select a project` dropdown menu, create a new project (or select an existing one).
-1. Click on `+ ENABLE APIS AND SERVICES` at the top of the page, then select  `Google Sheets API` for your project. Click on `ENABLE`
-1. From the API Console, click `Credentials` in the sidebar, then click on `+ CREATE CREDENTIALS` at the top of the page and select `Service account` to create a new service account key
-1. enter an account name (e.g. "MyAlfredAPI") and a description (e.g. "for Alfred Workflow")
-2. in `Manage service accounts`, select `Keys` and create a new JSON key, which will be downloaded onto your computer. This key contains your account credentials.
-3. Move that file to your preferred location, then enter the path to the file in `Key File` in `Workflow configuration`. This is required for the workflow to work. 
+> 🔒 `credentials.json`, `token.json`, and `prefs.plist` are **git-ignored and are never
+> bundled in the released workflow** — your account stays private to your machine.
 
-### If the Google sheet is private
-1. Copy the service account email address (go to `Manage service accounts`, hover over the email of your project, a copy icon will appear).
-![](images/screenshot_email.png)
-1. Share the private Google Sheet with the service account email address, granting it the appropriate access permissions.
+## 🧰 Changelog
 
+- 2026-08-09: version 0.1.1 — fixed a due-date off-by-one (a local-midnight→UTC conversion
+  could shift the date a day in timezones east of UTC; the date is now emitted at midnight
+  UTC so it is preserved everywhere). Rewrote this README (it previously described a different
+  workflow).
 
+## 🧐 Feedback
 
-# Changelog
-- 2024-02-01: first release (version 0.1)
-
-# Thanks
-- [tutorial](https://www.makeuseof.com/tag/read-write-google-sheets-python/) on how to access google sheets via Python 
-- Icons from [Flaticon](www.flaticon.com) 
-	- https://www.flaticon.com/free-icon/table-cell_6099818
-	- https://www.flaticon.com/free-icon/add-button_8246338
-	- https://www.flaticon.com/free-icon/spreadsheet_3919650
-
-
-# Feedback 🧐
-
-Feedback welcome! If you notice a bug, or have ideas for new features, please feel free to get in touch either here, or on the [Alfred](https://www.alfredforum.com) forum. 
-
+Feedback welcome! If you notice a bug or have an idea, please open an issue.

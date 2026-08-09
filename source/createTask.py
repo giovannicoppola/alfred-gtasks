@@ -346,8 +346,8 @@ def add_task(task_title, due_datetime=None):
         time_str = None
         
         if due_datetime is None:
-            # Default: tomorrow (next day) at midnight
-            due_date = datetime.datetime.utcnow() + datetime.timedelta(days=1)
+            # Default: tomorrow (next day) at midnight, local
+            due_date = datetime.datetime.now() + datetime.timedelta(days=1)
             due_date = due_date.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
             # Check if a time was specified (not midnight)
@@ -359,28 +359,11 @@ def add_task(task_title, due_datetime=None):
                 due_date = due_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
             else:
                 due_date = due_datetime
-        
-        # The Tasks API requires the due date to be a full RFC 3339 timestamp (ISO format)
-        # Convert local time to UTC properly, but only the date part matters
-        if due_date.tzinfo is None:
-            # No timezone info, assume it's local time
-            # Get the local timezone
-            import time
-            # Get timezone offset in seconds (negative for timezones ahead of UTC)
-            if time.daylight:
-                offset_seconds = -time.altzone
-            else:
-                offset_seconds = -time.timezone
-            offset_hours = offset_seconds / 3600
-            # Create timezone-aware datetime and convert to UTC
-            local_tz = datetime.timezone(datetime.timedelta(hours=offset_hours))
-            due_date_aware = due_date.replace(tzinfo=local_tz)
-            due_date_utc = due_date_aware.astimezone(datetime.timezone.utc)
-            due_date_iso = due_date_utc.isoformat("T").replace("+00:00", "Z")
-        else:
-            # Has timezone, convert to UTC and format
-            due_date_utc = due_date.astimezone(datetime.timezone.utc)
-            due_date_iso = due_date_utc.isoformat("T").replace("+00:00", "Z")
+
+        # Google Tasks stores only the calendar DATE (any time is ignored). Emit the
+        # intended date at midnight UTC so the date is preserved in every timezone —
+        # converting a local midnight to UTC would shift the date a day east of UTC.
+        due_date_iso = due_date.strftime("%Y-%m-%dT00:00:00.000Z")
         
         # 3. Prepare task title and notes
         # If time was specified, add it to the title
@@ -883,7 +866,7 @@ def output_alfred_items(tasks_json):
             "arg": task_id,  # Task ID passed as argument
             "valid": True,
             "icon": {
-                "path": "icon.png" if status != "completed" else "icon_completed.png"
+                "path": "icon.png" if status != "completed" else "checklist.png"
             }
         }
         
