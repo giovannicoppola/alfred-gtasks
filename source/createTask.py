@@ -1,1019 +1,790 @@
-import os
-import sys
-import json
-import re
+"""
+gTasks — create and manage Google Tasks from Alfred.
+
+Standard library only, so it runs on the macOS system /usr/bin/python3 with nothing to
+install. Talks to the Google Tasks REST API directly and does the OAuth "installed app"
+loopback flow itself.
+
+Commands (the Alfred objects call these; they also work from a terminal):
+  parse <text>          Script Filter: preview the task that <text> would create
+  create <json>         Action: create the task described by the parse output
+  list [--alfred|--json] [--completed]
+  complete <id|title|number>
+  delete <id|title|number>
+  auth                  Sign in to Google (opens the browser)
+  <text>                Create a task directly from <text>
+
+Under Alfred, stdout carries only Alfred JSON (Script Filters) or the one-line message
+for the notification (actions); diagnostics go to stderr (Alfred's debugger).
+"""
+import base64
+import calendar
 import datetime
-from dateutil.relativedelta import relativedelta
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import hashlib
+import http.client
+import http.server
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
-# Scope defines what permissions your script needs. tasks grants read/write access.
-# If you change this scope, you must delete the 'token.json' file for re-authorization.
-SCOPES = ["https://www.googleapis.com/auth/tasks"] 
+SCOPES = ["https://www.googleapis.com/auth/tasks"]
+API_BASE = "https://tasks.googleapis.com/tasks/v1"
+TASKLIST = "@default"   # the user's default list (documented alias)
+HTTP_TIMEOUT = 8        # seconds per request; a Script Filter must never hang
+AUTH_TIMEOUT = 180      # seconds to wait for the user to finish signing in
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+NOTES = "Added automatically via Python script from Mac."
 
-# Get the directory where this script is located
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Workflow Data is local to this Mac (not synced with Alfred's preferences) and survives
+# workflow updates, unlike the workflow folder itself.
+DATA_DIR = os.getenv("alfred_workflow_data") or os.path.expanduser(
+    "~/Library/Application Support/Alfred/Workflow Data/giovanni-gTasks")
+TOKEN_PATH = os.path.join(DATA_DIR, "token.json")
+LEGACY_TOKEN_PATH = os.path.join(SCRIPT_DIR, "token.json")
+LEGACY_CLIENT_PATH = os.path.join(SCRIPT_DIR, "credentials.json")
+UNDER_ALFRED = bool(os.getenv("alfred_version"))
 
-def get_google_service():
-    """Authenticates the user and returns the Google Tasks API service object."""
-    creds = None
-    token_path = os.path.join(SCRIPT_DIR, "token.json")
-    credentials_path = os.path.join(SCRIPT_DIR, "credentials.json")
-    
-    # token.json stores the user's access and refresh tokens after the first run.
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
-    
-    # If no valid credentials exist, prompt the user to log in via a web browser.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(credentials_path):
-                print(f"❌ ERROR: 'credentials.json' not found at {credentials_path}")
-                sys.exit(1)
-            
-            # Validate that credentials.json is an OAuth client ID, not a service account
-            try:
-                with open(credentials_path, 'r') as f:
-                    creds_data = json.load(f)
-                    if 'type' in creds_data and creds_data['type'] == 'service_account':
-                        print("❌ ERROR: Your credentials.json is a service account key.")
-                        print("   For Google Tasks API with OAuth2, you need an OAuth client ID instead.")
-                        print("\n   To fix this:")
-                        print("   1. Go to https://console.cloud.google.com/")
-                        print("   2. Select your project → APIs & Services → Credentials")
-                        print("   3. Click 'Create Credentials' → 'OAuth client ID'")
-                        print("   4. Choose 'Desktop app' as the application type")
-                        print("   5. Download the JSON and save it as 'credentials.json'")
-                        sys.exit(1)
-            except (json.JSONDecodeError, KeyError):
-                # If we can't parse it, let the OAuth flow handle the error
-                pass
-            
-            try:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    credentials_path, SCOPES
-                )
-                print("🌐 Opening browser for authentication...")
-                print("   If you see 'access_denied', check the OAuth consent screen configuration.")
-                creds = flow.run_local_server(port=0, open_browser=True)
-                
-                # Check if we got valid credentials
-                if not creds or not creds.valid:
-                    print("❌ ERROR: Authentication failed or was cancelled.")
-                    print("   Please ensure:")
-                    print("   1. You clicked 'Allow' in the browser")
-                    print("   2. Your email is added as a test user in OAuth consent screen")
-                    print("   3. The Google Tasks API scope is added to your consent screen")
-                    sys.exit(1)
-                    
-            except ValueError as e:
-                if "Client secrets must be for a web or installed app" in str(e):
-                    print("❌ ERROR: Invalid credentials file type.")
-                    print("   Your credentials.json must be an OAuth client ID (Desktop app type),")
-                    print("   not a service account key.")
-                    print("\n   To fix this:")
-                    print("   1. Go to https://console.cloud.google.com/")
-                    print("   2. Select your project → APIs & Services → Credentials")
-                    print("   3. Click 'Create Credentials' → 'OAuth client ID'")
-                    print("   4. Choose 'Desktop app' as the application type")
-                    print("   5. Download the JSON and save it as 'credentials.json'")
-                    print("   6. Make sure Google Tasks API is enabled in your project")
-                    sys.exit(1)
-                else:
-                    raise
-            except Exception as oauth_error:
-                error_str = str(oauth_error).lower()
-                if "access_denied" in error_str or "403" in error_str or "denied" in error_str:
-                    print("\n❌ ERROR: OAuth access denied (403)")
-                    print("=" * 60)
-                    print("This means Google is blocking the authentication request.")
-                    print("\n📋 STEP-BY-STEP FIX:")
-                    print("\n1. Go to: https://console.cloud.google.com/apis/credentials/consent")
-                    print("   (Or: Your Project → APIs & Services → OAuth consent screen)")
-                    print("\n2. If you see 'Configure Consent Screen' button, click it.")
-                    print("   If already configured, click 'EDIT APP'")
-                    print("\n3. Configure these settings:")
-                    print("   • User Type: Choose 'External' (unless you have Google Workspace)")
-                    print("   • App name: Enter any name (e.g., 'My Tasks App')")
-                    print("   • User support email: Your email")
-                    print("   • Developer contact: Your email")
-                    print("   • Click 'SAVE AND CONTINUE'")
-                    print("\n4. On 'Scopes' page:")
-                    print("   • Click 'ADD OR REMOVE SCOPES'")
-                    print("   • Search for: 'tasks'")
-                    print("   • Check: '.../auth/tasks' (Google Tasks API)")
-                    print("   • Click 'UPDATE' then 'SAVE AND CONTINUE'")
-                    print("\n5. On 'Test users' page:")
-                    print("   • Click '+ ADD USERS'")
-                    print("   • Add YOUR Google account email address")
-                    print("   • Click 'ADD' then 'SAVE AND CONTINUE'")
-                    print("\n6. Review and go back to Dashboard")
-                    print("\n7. Verify Google Tasks API is enabled:")
-                    print("   • Go to: https://console.cloud.google.com/apis/library")
-                    print("   • Search: 'Tasks API'")
-                    print("   • Click 'ENABLE' if not already enabled")
-                    print("\n8. Wait 1-2 minutes, then try running the script again.")
-                    print("=" * 60)
-                    sys.exit(1)
-                else:
-                    print(f"❌ OAuth error: {oauth_error}")
-                    print("\nIf you saw 'access_denied' in the browser, follow the steps above.")
-                    sys.exit(1)
-        
-        # Save the credentials for the next run
-        with open(token_path, "w") as token:
-            token.write(creds.to_json())
-    
-    # Build and return the Tasks API service
-    return build("tasks", "v1", credentials=creds)
 
-def parse_date_from_string(input_string):
-    """
-    Parses date and time from input string and returns (cleaned_title, due_datetime).
-    Supports formats:
-    - mm-dd (e.g., 11-23) - next occurrence in future
-    - yyyy-mm-dd (e.g., 2025-12-03) - specific date
-    - mm-dd:hh:mm (e.g., 11-23:23:30) - date with time
-    - Natural language: 'today', 'tomorrow', 'next saturday', etc.
-    Returns (cleaned_title, due_datetime) where due_datetime is None if no date found.
-    """
-    now = datetime.datetime.now()
-    cleaned_title = input_string
-    due_datetime = None
-    time_component = None
-    
-    # Pattern for mm-dd:hh:mm or mm-dd (with optional time)
-    # Time format: :hh:mm directly after the date (24-hour format)
-    # Match date, optionally followed by time, then ensure it's followed by space, end, or non-digit/non-colon
-    date_time_pattern = r'\b(\d{1,2})-(\d{1,2})(?::(\d{1,2}):(\d{2}))?(?=\s|$|[^\d:])'
-    # Pattern for yyyy-mm-dd (with optional time)
-    # Time format: :hh:mm directly after the date (24-hour format)
-    full_date_pattern = r'\b(\d{4})-(\d{1,2})-(\d{1,2})(?::(\d{1,2}):(\d{2}))?(?=\s|$|[^\d:])'
-    
-    # Try to match yyyy-mm-dd format first
-    full_date_match = re.search(full_date_pattern, input_string)
-    if full_date_match:
-        year, month, day = int(full_date_match.group(1)), int(full_date_match.group(2)), int(full_date_match.group(3))
-        # Check if time groups exist and are not empty strings
-        hour_str = full_date_match.group(4)
-        minute_str = full_date_match.group(5)
-        hour = int(hour_str) if hour_str and hour_str.strip() else None
-        minute = int(minute_str) if minute_str and minute_str.strip() else None
-        
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Errors: each carries a message that is safe to show the user.
+# ---------------------------------------------------------------------------
+
+class WorkflowError(Exception):
+    pass
+
+
+class ConfigError(WorkflowError):
+    """The OAuth client file (KEYFILE) is missing or the wrong kind."""
+
+
+class AuthRequired(WorkflowError):
+    """No usable sign-in: the user must (re-)authorize in the browser."""
+
+
+class NetworkError(WorkflowError):
+    pass
+
+
+class ApiError(WorkflowError):
+    def __init__(self, status, reason, message):
+        super().__init__(f"Google returned {status}: {message}")
+        self.status = status
+        self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+def _error_details(err):
+    """(reason, message) from a Google error body (API or OAuth token endpoint)."""
+    try:
+        body = json.loads(err.read() or b"{}")
+    except ValueError:
+        return "", err.reason
+    error = body.get("error")
+    if isinstance(error, dict):  # API: {"error": {"code", "message", "status"}}
+        return error.get("status", ""), error.get("message", err.reason)
+    if isinstance(error, str):   # OAuth: {"error": "invalid_grant", "error_description"}
+        return error, body.get("error_description", error)
+    return "", err.reason
+
+
+def http_request(method, url, *, params=None, body=None, form=None, token=None, retries=0):
+    """Send one JSON request. Retries only fast failures (429/5xx), never timeouts."""
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    headers = {"Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    elif form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            due_datetime = datetime.datetime(year, month, day)
-            if hour is not None and minute is not None:
-                due_datetime = due_datetime.replace(hour=hour, minute=minute)
-            elif hour is not None:
-                due_datetime = due_datetime.replace(hour=hour, minute=0)
-            
-            # Remove the matched pattern from title
-            cleaned_title = re.sub(full_date_pattern, '', cleaned_title, count=1).strip()
-            # Clean up extra spaces
-            cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-            return (cleaned_title, due_datetime)
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                raw = resp.read()
+            return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as err:
+            reason, message = _error_details(err)
+            if err.code in RETRY_STATUSES and attempt < retries:
+                time.sleep(0.5 * 2 ** attempt)
+                continue
+            raise ApiError(err.code, reason, message)
+        except (OSError, http.client.HTTPException) as err:  # URLError, timeout, reset
+            raise NetworkError(f"Can't reach Google ({getattr(err, 'reason', err)})")
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+# ---------------------------------------------------------------------------
+# Token storage
+# ---------------------------------------------------------------------------
+
+def _write_token(token):
+    """Write the token atomically, readable only by this user (mkstemp makes it 0600)."""
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".token-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(token, f)
+        os.replace(tmp, TOKEN_PATH)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def _read_token_file(path):
+    try:
+        with open(path) as f:
+            token = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(token, dict) or not token.get("refresh_token"):
+        return None
+    return token
+
+
+def _load_token():
+    """The stored token, or None if signed out (missing or corrupt file)."""
+    if not os.path.exists(TOKEN_PATH) and os.path.exists(LEGACY_TOKEN_PATH):
+        # v0.1 kept token.json in the workflow folder (synced, wiped on update): move it.
+        legacy = _read_token_file(LEGACY_TOKEN_PATH)
+        if legacy:
+            _write_token(legacy)
+            log(f"Moved token from {LEGACY_TOKEN_PATH} to {TOKEN_PATH}")
+        os.remove(LEGACY_TOKEN_PATH)
+    if not os.path.exists(TOKEN_PATH):
+        return None
+    token = _read_token_file(TOKEN_PATH)
+    if token is None:
+        log(f"Ignoring unreadable token at {TOKEN_PATH}")
+    return token
+
+
+def _forget_token():
+    try:
+        os.remove(TOKEN_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def _utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+def _expired(token):
+    expiry = token.get("expiry")
+    if not token.get("token") or not expiry:
+        return True
+    try:
+        expires = datetime.datetime.fromisoformat(expiry.rstrip("Z"))
+    except ValueError:
+        return True
+    # Stored as naive UTC (same format google-auth uses); refresh a minute early.
+    return _utcnow() >= expires - datetime.timedelta(seconds=60)
+
+
+def _apply_grant(token, grant):
+    token["token"] = grant["access_token"]
+    expires = _utcnow() + datetime.timedelta(seconds=int(grant.get("expires_in", 3600)))
+    token["expiry"] = expires.isoformat() + "Z"
+    if grant.get("refresh_token"):
+        token["refresh_token"] = grant["refresh_token"]
+    return token
+
+
+# ---------------------------------------------------------------------------
+# OAuth
+# ---------------------------------------------------------------------------
+
+def _read_client_file(path):
+    """The 'installed'/'web' section of an OAuth client JSON; raises ConfigError."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        raise ConfigError(f"Key file not found: {path}")
+    except (OSError, ValueError):
+        raise ConfigError(f"Key file is not valid JSON: {path}")
+    if data.get("type") == "service_account":
+        raise ConfigError("Key file is a service-account key; Google Tasks needs an OAuth "
+                          "client ID of type 'Desktop app'")
+    client = data.get("installed") or data.get("web")
+    if not client or not client.get("client_id"):
+        raise ConfigError("Key file is not an OAuth client ID (Desktop app) JSON")
+    return client
+
+
+def load_client():
+    """The OAuth client from KEYFILE, falling back to credentials.json from v0.1."""
+    keyfile = os.path.expanduser(os.getenv("KEYFILE", "").strip())
+    if keyfile:
+        try:
+            return _read_client_file(keyfile)
+        except ConfigError as err:
+            if not os.path.exists(LEGACY_CLIENT_PATH):
+                raise
+            log(f"{err}; using {LEGACY_CLIENT_PATH} instead")
+    if os.path.exists(LEGACY_CLIENT_PATH):
+        return _read_client_file(LEGACY_CLIENT_PATH)
+    raise ConfigError("Set 'Key File' in the workflow configuration (see 'Setting up')")
+
+
+def _b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def authorize():
+    """Interactive sign-in: loopback redirect with PKCE. Returns and stores the token."""
+    client = load_client()
+    verifier = _b64url(secrets.token_bytes(32))
+    state = secrets.token_urlsafe(16)
+    result = {}
+
+    class Callback(http.server.BaseHTTPRequestHandler):
+        timeout = 5  # drop idle browser preconnects instead of blocking on them
+
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" not in query and "error" not in query:
+                self.send_error(404)  # e.g. /favicon.ico
+                return
+            result.update({k: v[0] for k, v in query.items()})
+            ok = "code" in query and query.get("state", [""])[0] == state
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(("<h3>gTasks: signed in — you can close this tab.</h3>" if ok else
+                              "<h3>gTasks: sign-in failed — see Alfred.</h3>").encode())
+
+        def log_message(self, format, *args):  # keep the request log out of stderr
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Callback)
+    redirect_uri = f"http://127.0.0.1:{server.server_port}/"
+    auth_url = client.get("auth_uri", "https://accounts.google.com/o/oauth2/auth") + "?" + \
+        urllib.parse.urlencode({
+            "client_id": client["client_id"],
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": " ".join(SCOPES),
+            "state": state,
+            "code_challenge": _b64url(hashlib.sha256(verifier.encode()).digest()),
+            "code_challenge_method": "S256",
+            "access_type": "offline",
+            "prompt": "consent",  # always issue a refresh token, also on re-authorization
+        })
+    log("Opening browser for Google sign-in")
+    subprocess.run(["/usr/bin/open", auth_url], check=False)
+
+    server.timeout = 1
+    deadline = time.monotonic() + AUTH_TIMEOUT
+    try:
+        while not result and time.monotonic() < deadline:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    if not result:
+        raise AuthRequired("Sign-in timed out — try again")
+    if "error" in result:
+        raise AuthRequired(f"Sign-in was not completed ({result['error']}). Check that your "
+                           "account is a test user on the OAuth consent screen")
+    if result.get("state") != state:
+        raise AuthRequired("Sign-in response did not match this request — try again")
+
+    token_uri = client.get("token_uri", "https://oauth2.googleapis.com/token")
+    try:
+        grant = http_request("POST", token_uri, form={
+            "grant_type": "authorization_code",
+            "code": result["code"],
+            "code_verifier": verifier,
+            "client_id": client["client_id"],
+            "client_secret": client.get("client_secret", ""),
+            "redirect_uri": redirect_uri,
+        })
+    except ApiError as err:
+        raise AuthRequired(f"Google refused the sign-in: {err}")
+    token = _apply_grant({
+        "token_uri": token_uri,
+        "client_id": client["client_id"],
+        "client_secret": client.get("client_secret", ""),
+        "scopes": SCOPES,
+    }, grant)
+    _write_token(token)
+    return token
+
+
+def _refresh(token):
+    try:
+        grant = http_request("POST", token.get("token_uri", "https://oauth2.googleapis.com/token"), form={
+            "grant_type": "refresh_token",
+            "refresh_token": token["refresh_token"],
+            "client_id": token.get("client_id", ""),
+            "client_secret": token.get("client_secret", ""),
+        })
+    except ApiError as err:
+        if err.status in (400, 401):
+            # invalid_grant: revoked, or the 7-day expiry Google applies to OAuth apps
+            # whose consent screen is still in "Testing".
+            _forget_token()
+            raise AuthRequired("Google sign-in expired — press ↩ to sign in again")
+        raise
+    token = _apply_grant(token, grant)
+    _write_token(token)
+    return token
+
+
+def access_token(interactive, force_refresh=False):
+    """A valid access token. Non-interactive callers (Script Filters) never open a browser."""
+    token = _load_token()
+    if token is None:
+        if not interactive:
+            raise AuthRequired("Sign in to Google — press ↩")
+        token = authorize()
+    elif force_refresh or _expired(token):
+        try:
+            token = _refresh(token)
+        except AuthRequired:
+            if not interactive:
+                raise
+            token = authorize()
+    return token["token"]
+
+
+def api(method, path, *, interactive, params=None, body=None, retries=0):
+    """Authorized Tasks API call; refreshes once if Google says the token is stale."""
+    url = API_BASE + path
+    token = access_token(interactive)
+    try:
+        return http_request(method, url, params=params, body=body, token=token, retries=retries)
+    except ApiError as err:
+        if err.status != 401:
+            raise
+    token = access_token(interactive, force_refresh=True)
+    return http_request(method, url, params=params, body=body, token=token, retries=retries)
+
+
+# ---------------------------------------------------------------------------
+# Google Tasks
+# ---------------------------------------------------------------------------
+
+def _task_path(task_id=""):
+    path = f"/lists/{urllib.parse.quote(TASKLIST, safe='@')}/tasks"
+    return f"{path}/{urllib.parse.quote(task_id, safe='')}" if task_id else path
+
+
+def fetch_tasks(interactive, show_completed=False):
+    """All tasks in the default list, following pagination."""
+    tasks, page = [], None
+    while True:
+        resp = api("GET", _task_path(), interactive=interactive, retries=2, params={
+            "showCompleted": str(show_completed).lower(),
+            # Tasks completed in Google's own apps (incl. the iPhone app) are "hidden".
+            "showHidden": str(show_completed).lower(),
+            "maxResults": 100,
+            "pageToken": page,
+        })
+        tasks += resp.get("items", [])
+        page = resp.get("nextPageToken")
+        if not page:
+            return tasks
+
+
+def get_task(task_id):
+    return api("GET", _task_path(task_id), interactive=True, retries=2)
+
+
+def insert_task(title, due=None):
+    """Create a task. No retries: a retried insert could create a duplicate."""
+    body = {"title": title, "notes": NOTES}
+    if due is not None:
+        # Google Tasks keeps only the DATE. Send it at midnight UTC so it is the same
+        # calendar date in every timezone.
+        body["due"] = due.strftime("%Y-%m-%dT00:00:00.000Z")
+    return api("POST", _task_path(), interactive=True, body=body)
+
+
+def complete_task_by_id(task_id):
+    # PATCH only the status (not GET + full PUT), so edits made meanwhile on another
+    # device are not overwritten. Idempotent, so safe to retry.
+    return api("PATCH", _task_path(task_id), interactive=True, retries=2,
+               body={"status": "completed"})
+
+
+def delete_task_by_id(task_id):
+    api("DELETE", _task_path(task_id), interactive=True, retries=2)
+
+
+def due_date(task):
+    """'YYYY-MM-DD' from a task's due timestamp, or ''."""
+    return task.get("due", "").split("T")[0]
+
+
+# ---------------------------------------------------------------------------
+# Date parsing
+# ---------------------------------------------------------------------------
+
+WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+# Whole words only: "today's" or "Mondays" are not dates.
+_L, _R = r"(?<![\w'’])", r"(?![\w'’])"
+_TIME = r"(?::(\d{1,2}):(\d{2}))?"
+# yyyy-mm-dd[:hh:mm] anywhere in the text.
+FULL_DATE_RE = re.compile(r"(?<![\w-])(\d{4})-(\d{1,2})-(\d{1,2})" + _TIME + r"(?![\w:-])")
+# mm-dd or mm/dd [:hh:mm] only as the LAST word, so "pages 3-5 tomorrow" or
+# "buy 2-3 apples" are not read as dates.
+SHORT_DATE_RE = re.compile(r"(?:^|\s)(\d{1,2})[-/](\d{1,2})" + _TIME + r"\s*$")
+
+
+def _midnight(dt):
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _add_months(dt, months):
+    month0 = dt.month - 1 + months
+    year, month = dt.year + month0 // 12, month0 % 12 + 1
+    return dt.replace(year=year, month=month, day=min(dt.day, calendar.monthrange(year, month)[1]))
+
+
+def _next_weekday(now, weekday):
+    """The next occurrence of weekday, always in the future (today's weekday -> +7)."""
+    days_ahead = (WEEKDAYS.index(weekday) - now.weekday()) % 7 or 7
+    return _midnight(now + datetime.timedelta(days=days_ahead))
+
+
+def _with_time(date, hour, minute):
+    if hour is None:
+        return date
+    return date.replace(hour=int(hour), minute=int(minute))
+
+
+def _remove(text, match):
+    return re.sub(r"\s+", " ", text[:match.start()] + " " + text[match.end():]).strip()
+
+
+def parse_date_from_string(text, now=None):
+    """
+    Split text into (title, due_datetime). due_datetime is None when no date is found, and
+    has hour/minute set only when a time was given. Recognised:
+      today, tomorrow, monday..sunday, next monday..sunday, next week, next month,
+      in N days|weeks|months, yyyy-mm-dd anywhere, mm-dd or mm/dd as the last word;
+      numeric dates take an optional :hh:mm (24h).
+    """
+    now = now or datetime.datetime.now()
+
+    m = FULL_DATE_RE.search(text)
+    if m:
+        try:
+            due = _with_time(datetime.datetime(int(m[1]), int(m[2]), int(m[3])), m[4], m[5])
+            return _remove(text, m), due
+        except ValueError:
+            pass  # not a real date/time: leave it in the title
+
+    m = SHORT_DATE_RE.search(text)
+    if m:
+        try:
+            month, day = int(m[1]), int(m[2])
+            due = _with_time(datetime.datetime(now.year, month, day), m[3], m[4])
+            # Next occurrence: today still counts unless its time has already passed.
+            in_past = due < now.replace(second=0, microsecond=0) if m[3] else due.date() < now.date()
+            if in_past:
+                due = due.replace(year=now.year + 1)
+            return _remove(text, m), due
         except ValueError:
             pass
-    
-    # Try to match mm-dd:hh:mm or mm-dd format
-    date_match = re.search(date_time_pattern, input_string)
-    if date_match:
-        month, day = int(date_match.group(1)), int(date_match.group(2))
-        # Check if time groups exist and are not empty strings
-        hour_str = date_match.group(3)
-        minute_str = date_match.group(4)
-        hour = int(hour_str) if hour_str and hour_str.strip() else None
-        minute = int(minute_str) if minute_str and minute_str.strip() else None
-        
-        # Find next occurrence of this date in the future
-        current_year = now.year
+
+    m = re.search(_L + r"today" + _R, text, re.I)
+    if m:
+        return _remove(text, m), _midnight(now)
+
+    m = re.search(_L + r"tomorrow" + _R, text, re.I)
+    if m:
+        return _remove(text, m), _midnight(now + datetime.timedelta(days=1))
+
+    m = re.search(_L + r"next\s+(" + "|".join(WEEKDAYS) + r")" + _R, text, re.I)
+    if m:
+        return _remove(text, m), _next_weekday(now, m[1].lower())
+
+    m = re.search(_L + r"(" + "|".join(WEEKDAYS) + r")" + _R, text, re.I)
+    if m:
+        return _remove(text, m), _next_weekday(now, m[1].lower())
+
+    m = re.search(_L + r"in\s+(\d+)\s+(days?|weeks?|months?)" + _R, text, re.I)
+    if m:
+        amount, unit = int(m[1]), m[2].lower()
+        if unit.startswith("month"):
+            due = _add_months(now, amount)
+        else:
+            due = now + datetime.timedelta(days=amount * (7 if unit.startswith("week") else 1))
+        return _remove(text, m), _midnight(due)
+
+    m = re.search(_L + r"next\s+(week|month)" + _R, text, re.I)
+    if m:
+        due = now + datetime.timedelta(weeks=1) if m[1].lower() == "week" else _add_months(now, 1)
+        return _remove(text, m), _midnight(due)
+
+    return text.strip(), None
+
+
+def _has_time(dt):
+    return dt.hour != 0 or dt.minute != 0
+
+
+def create_task(title, due=None):
+    """Create a task; a time of day (which Google Tasks can't store) goes in the title."""
+    notes_time = ""
+    if due is not None and _has_time(due):
+        notes_time = f"{due.hour:02d}:{due.minute:02d}"
+        title = f"{title} at {notes_time}"
+    result = insert_task(title, _midnight(due) if due is not None else None)
+    when = f" — due {due_date(result)}" if result.get("due") else ""
+    return f"✅ Created: {result.get('title', title)}{when}"
+
+
+# ---------------------------------------------------------------------------
+# Finding a task from the CLI (Alfred always passes the task ID)
+# ---------------------------------------------------------------------------
+
+def _looks_like_id(identifier):
+    return len(identifier) > 20 and re.fullmatch(r"[A-Za-z0-9_-]+", identifier) is not None
+
+
+def find_task(identifier, include_completed):
+    """Resolve a task ID, a number from `list`, or a unique part of a title."""
+    if _looks_like_id(identifier):
         try:
-            # Try current year first
-            candidate = datetime.datetime(current_year, month, day)
-            
-            # If time is specified, set it on the candidate for proper comparison
-            if hour is not None and minute is not None:
-                candidate = candidate.replace(hour=hour, minute=minute)
-            elif hour is not None:
-                candidate = candidate.replace(hour=hour, minute=0)
-            else:
-                # No time specified, set to start of day for comparison
-                candidate = candidate.replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            # Compare with current time (also normalized)
-            now_normalized = now.replace(second=0, microsecond=0)
-            if candidate < now_normalized:
-                # If it's in the past, try next year
-                candidate = datetime.datetime(current_year + 1, month, day)
-                if hour is not None and minute is not None:
-                    candidate = candidate.replace(hour=hour, minute=minute)
-                elif hour is not None:
-                    candidate = candidate.replace(hour=hour, minute=0)
-                else:
-                    candidate = candidate.replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            due_datetime = candidate
-            
-            # Remove the matched pattern from title
-            cleaned_title = re.sub(date_time_pattern, '', cleaned_title, count=1).strip()
-            # Clean up extra spaces
-            cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-            return (cleaned_title, due_datetime)
-        except ValueError:
-            pass
-    
-    # Try natural language dates (today, tomorrow, next saturday, etc.)
-    # Check for "today"
-    if re.search(r'\btoday\b', input_string, re.IGNORECASE):
-        due_datetime = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        cleaned_title = re.sub(r'\btoday\b', '', cleaned_title, flags=re.IGNORECASE, count=1).strip()
-        cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-        return (cleaned_title, due_datetime)
-    
-    # Check for "tomorrow"
-    if re.search(r'\btomorrow\b', input_string, re.IGNORECASE):
-        due_datetime = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        cleaned_title = re.sub(r'\btomorrow\b', '', cleaned_title, flags=re.IGNORECASE, count=1).strip()
-        cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-        return (cleaned_title, due_datetime)
-    
-    # Check for "next [weekday]" first (more specific pattern, should be checked first)
-    next_weekday_match = re.search(r'\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', input_string, re.IGNORECASE)
-    if next_weekday_match:
-        weekday_name = next_weekday_match.group(1).lower()
-        due_datetime = _get_next_weekday(weekday_name)
-        cleaned_title = re.sub(r'\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b', '', cleaned_title, flags=re.IGNORECASE, count=1).strip()
-        cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-        return (cleaned_title, due_datetime)
-    
-    # Check for standalone weekday (e.g., "Monday", "Sunday") - means following weekday
-    # Check all weekdays and pick the first one that's not preceded by "next"
-    for weekday in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']:
-        pattern = r'\b' + weekday + r'\b'
-        match = re.search(pattern, input_string, re.IGNORECASE)
-        if match:
-            # Check if "next" appears before this match
-            match_start = match.start()
-            before_text = input_string[:match_start].lower().rstrip()
-            # Check if "next" is the word immediately before (allowing for whitespace)
-            if not re.search(r'\bnext\s*$', before_text):
-                weekday_name = weekday
-                due_datetime = _get_next_weekday(weekday_name)
-                cleaned_title = re.sub(pattern, '', cleaned_title, flags=re.IGNORECASE, count=1).strip()
-                cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-                return (cleaned_title, due_datetime)
-    
-    # Try "in X days/weeks/months" pattern
-    in_days_match = re.search(r'\bin\s+(\d+)\s+(day|days|week|weeks|month|months)\b', input_string, re.IGNORECASE)
-    if in_days_match:
-        try:
-            amount = int(in_days_match.group(1))
-            unit = in_days_match.group(2).lower()
-            
-            if unit in ['day', 'days']:
-                due_datetime = (now + datetime.timedelta(days=amount)).replace(hour=0, minute=0, second=0, microsecond=0)
-            elif unit in ['week', 'weeks']:
-                due_datetime = (now + datetime.timedelta(weeks=amount)).replace(hour=0, minute=0, second=0, microsecond=0)
-            elif unit in ['month', 'months']:
-                due_datetime = (now + relativedelta(months=amount)).replace(hour=0, minute=0, second=0, microsecond=0)
-            else:
-                due_datetime = (now + datetime.timedelta(days=amount)).replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            cleaned_title = re.sub(r'\bin\s+\d+\s+(day|days|week|weeks|month|months)\b', '', cleaned_title, flags=re.IGNORECASE, count=1).strip()
-            cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-            return (cleaned_title, due_datetime)
-        except Exception:
-            pass
-    
-    # Try "next week" or "next month"
-    next_period_match = re.search(r'\bnext\s+(week|month)\b', input_string, re.IGNORECASE)
-    if next_period_match:
-        try:
-            period = next_period_match.group(1).lower()
-            if period == 'week':
-                due_datetime = (now + datetime.timedelta(weeks=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            elif period == 'month':
-                due_datetime = (now + relativedelta(months=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            
-            cleaned_title = re.sub(r'\bnext\s+(week|month)\b', '', cleaned_title, flags=re.IGNORECASE, count=1).strip()
-            cleaned_title = re.sub(r'\s+', ' ', cleaned_title)
-            return (cleaned_title, due_datetime)
-        except Exception:
-            pass
-    
-    return (cleaned_title, None)
+            return get_task(identifier)
+        except ApiError as err:
+            if err.status not in (400, 404):
+                raise  # otherwise fall through: maybe it's a long one-word title
 
-def _get_next_weekday(weekday_name):
-    """Get the next occurrence of a weekday."""
-    now = datetime.datetime.now()
-    weekday_map = {
-        'monday': 0, 'tuesday': 1, 'wednesday': 2, 'thursday': 3,
-        'friday': 4, 'saturday': 5, 'sunday': 6
-    }
-    target_weekday = weekday_map.get(weekday_name.lower())
-    if target_weekday is None:
-        return (now + datetime.timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    current_weekday = now.weekday()
-    days_ahead = target_weekday - current_weekday
-    
-    # If the target weekday is today or has already passed this week, get next week's occurrence
-    if days_ahead <= 0:
-        days_ahead += 7
-    
-    return (now + datetime.timedelta(days=days_ahead)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if identifier.isdigit():
+        tasks = fetch_tasks(interactive=True)  # numbers refer to `list` (open tasks)
+        number = int(identifier)
+        if not 1 <= number <= len(tasks):
+            raise WorkflowError(f"Task number {number} is out of range (1-{len(tasks)})")
+        return tasks[number - 1]
 
-def add_task(task_title, due_datetime=None):
-    """Adds a task with a title and optional due date."""
-    
-    try:
-        service = get_google_service()
-        
-        # 1. Determine the task list ID (use the default primary list)
-        task_lists = service.tasklists().list(maxResults=1).execute()
-        # Fallback to the default list ID if the list is empty
-        task_list_id = task_lists.get("items", [{}])[0].get("id", "@default")
+    query = identifier.lower()
+    tasks = fetch_tasks(interactive=True, show_completed=include_completed)
+    matches = [t for t in tasks if query in t.get("title", "").lower()]
+    exact = [t for t in matches if t.get("title", "").lower() == query]
+    if len(exact) == 1:
+        return exact[0]
+    if not matches:
+        raise WorkflowError(f"No task matches '{identifier}'")
+    if len(matches) > 1:
+        titles = ", ".join(f"'{t.get('title', '')}'" for t in matches[:5])
+        raise WorkflowError(f"{len(matches)} tasks match '{identifier}' ({titles}); be more specific")
+    return matches[0]
 
-        # 2. Calculate the due date
-        # Note: Google Tasks API only supports dates, not times. If a time is specified,
-        # we'll include it in the task title/notes and set the due date to midnight.
-        time_specified = False
-        time_str = None
-        
-        if due_datetime is None:
-            # Default: tomorrow (next day) at midnight, local
-            due_date = datetime.datetime.now() + datetime.timedelta(days=1)
-            due_date = due_date.replace(hour=0, minute=0, second=0, microsecond=0)
-        else:
-            # Check if a time was specified (not midnight)
-            if due_datetime.hour != 0 or due_datetime.minute != 0:
-                time_specified = True
-                # Format time as HH:MM in 24-hour format
-                time_str = f"{due_datetime.hour:02d}:{due_datetime.minute:02d}"
-                # Set due date to just the date part (midnight)
-                due_date = due_datetime.replace(hour=0, minute=0, second=0, microsecond=0)
-            else:
-                due_date = due_datetime
 
-        # Google Tasks stores only the calendar DATE (any time is ignored). Emit the
-        # intended date at midnight UTC so the date is preserved in every timezone —
-        # converting a local midnight to UTC would shift the date a day east of UTC.
-        due_date_iso = due_date.strftime("%Y-%m-%dT00:00:00.000Z")
-        
-        # 3. Prepare task title and notes
-        # If time was specified, add it to the title
-        final_title = task_title
-        notes = "Added automatically via Python script from Mac."
-        
-        if time_specified:
-            # Add time to the title
-            final_title = f"{task_title} at {time_str}"
-            notes = f"Time: {time_str}\n{notes}"
-        
-        # 4. Define the task body
-        task_body = {
-            "title": final_title,
-            "due": due_date_iso,
-            "notes": notes,
-        }
+def complete_task(identifier):
+    task = find_task(identifier, include_completed=False)
+    result = complete_task_by_id(task["id"])
+    return f"🎯 Task completed: {result.get('title') or task.get('title') or '(No title)'}"
 
-        # 5. Insert the task
-        result = service.tasks().insert(tasklist=task_list_id, body=task_body).execute()
-        print(f"✅ Success! Task created: {result['title']}")
-        
-        # Format the due date for display
-        if 'due' in result:
-            due_from_api = result['due']
-            due_display = due_from_api.split('T')[0]
-            if time_specified:
-                print(f"   Due date: {due_display} at {time_str} (time included in title)")
-            else:
-                print(f"   Due date: {due_display}")
-        else:
-            print(f"   Due date: Not set")
 
-    except HttpError as err:
-        print(f"❌ An HTTP error occurred: {err}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-        sys.exit(1)
+def delete_task(identifier):
+    task = find_task(identifier, include_completed=True)
+    delete_task_by_id(task["id"])
+    return f"🗑️ Task deleted: {task.get('title') or '(No title)'}"
 
-def list_tasks(show_completed=False, max_results=100, json_output=False):
-    """Lists all tasks from the default task list."""
-    
-    try:
-        service = get_google_service()
-        
-        # 1. Determine the task list ID (use the default primary list)
-        task_lists = service.tasklists().list(maxResults=1).execute()
-        task_list_id = task_lists.get("items", [{}])[0].get("id", "@default")
-        
-        # 2. List tasks
-        tasks_result = service.tasks().list(
-            tasklist=task_list_id,
-            showCompleted=show_completed,
-            maxResults=max_results
-        ).execute()
-        
-        tasks = tasks_result.get("items", [])
-        
-        if json_output:
-            # Output as JSON with full task IDs
-            import json
-            # Format tasks for JSON output
-            formatted_tasks = []
-            for task in tasks:
-                formatted_task = {
-                    "id": task.get("id", ""),
-                    "title": task.get("title", ""),
-                    "status": task.get("status", ""),
-                    "due": task.get("due", ""),
-                    "notes": task.get("notes", ""),
-                    "updated": task.get("updated", ""),
-                    "position": task.get("position", "")
-                }
-                formatted_tasks.append(formatted_task)
-            
-            output = {
-                "task_list_id": task_list_id,
-                "count": len(formatted_tasks),
-                "tasks": formatted_tasks
-            }
-            print(json.dumps(output, indent=2))
-            return
-        
-        # Human-readable output
-        if not tasks:
-            print("No tasks found.")
-            return
-        
-        print(f"\n📋 Found {len(tasks)} task(s):\n")
-        
-        for i, task in enumerate(tasks, 1):
-            title = task.get("title", "(No title)")
-            status = task.get("status", "")
-            due = task.get("due", "")
-            task_id = task.get("id", "")
-            
-            # Format status
-            status_icon = "✅" if status == "completed" else "⏳"
-            
-            # Format due date
-            due_str = ""
-            if due:
-                try:
-                    # Parse the due date (format: 2025-12-30T00:00:00.000Z)
-                    due_date = due.split("T")[0]
-                    due_str = f" | Due: {due_date}"
-                except:
-                    due_str = f" | Due: {due}"
-            
-            # Show task ID for reference (truncated)
-            id_display = f" [{task_id[:8]}...]" if task_id and len(task_id) > 8 else ""
-            print(f"{i}. {status_icon} {title}{due_str}{id_display}")
-        
-        print(f"\n💡 To complete a task, use:")
-        print(f"   python createTask.py complete <number>")
-        print(f"   python createTask.py complete 'task title'")
-        print(f"   python createTask.py complete <task-id>")
-        print()
-        
-    except HttpError as err:
-        print(f"❌ An HTTP error occurred: {err}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-        sys.exit(1)
 
-def complete_task(task_identifier):
-    """
-    Marks a task as completed.
-    Can match by:
-    - Task ID (if it looks like an ID)
-    - Task title (partial match, case-insensitive)
-    - Task number from list (if numeric)
-    """
-    
-    try:
-        service = get_google_service()
-        
-        # 1. Determine the task list ID (use the default primary list)
-        task_lists = service.tasklists().list(maxResults=1).execute()
-        task_list_id = task_lists.get("items", [{}])[0].get("id", "@default")
-        
-        # 2. Check if identifier looks like a task ID (long alphanumeric string)
-        # Google Tasks IDs are typically long strings like "MDIzODQ2NzI2ODE4NDE4ODUyNzA6MTIzNDU2Nzg5MA"
-        if len(task_identifier) > 20 and task_identifier.replace('_', '').replace('-', '').isalnum():
-            # Looks like a task ID, fetch the task first, then update it
-            try:
-                # Get the existing task to preserve all fields
-                existing_task = service.tasks().get(
-                    tasklist=task_list_id,
-                    task=task_identifier
-                ).execute()
-                
-                # Update with all existing fields plus status change
-                updated_task = existing_task.copy()
-                updated_task["status"] = "completed"
-                
-                result = service.tasks().update(
-                    tasklist=task_list_id,
-                    task=task_identifier,
-                    body=updated_task
-                ).execute()
-                print(f"🎯 Task completed: {result.get('title', '(No title)')}")
-                return
-            except HttpError as err:
-                print(f"❌ Task ID not found or error: {err}")
-                sys.exit(1)
-        
-        # 3. Check if identifier is a number (for selecting from list)
-        if task_identifier.isdigit():
-            # Get all incomplete tasks
-            tasks_result = service.tasks().list(
-                tasklist=task_list_id,
-                showCompleted=False,
-                maxResults=100
-            ).execute()
-            tasks = tasks_result.get("items", [])
-            
-            task_num = int(task_identifier)
-            if task_num < 1 or task_num > len(tasks):
-                print(f"❌ Task number {task_num} is out of range (1-{len(tasks)})")
-                return
-            
-            task_to_complete = tasks[task_num - 1]
-            task_id = task_to_complete.get("id")
-            task_title_actual = task_to_complete.get("title", "(No title)")
-        else:
-            # 4. Search by title (case-insensitive, partial match)
-            tasks_result = service.tasks().list(
-                tasklist=task_list_id,
-                showCompleted=False,  # Only search incomplete tasks
-                maxResults=100
-            ).execute()
-            
-            tasks = tasks_result.get("items", [])
-            
-            # Find matching tasks
-            matching_tasks = []
-            task_title_lower = task_identifier.lower()
-            
-            for task in tasks:
-                task_title_from_api = task.get("title", "").lower()
-                if task_title_lower in task_title_from_api or task_title_from_api in task_title_lower:
-                    matching_tasks.append(task)
-            
-            if not matching_tasks:
-                print(f"❌ No incomplete task found matching '{task_identifier}'")
-                print(f"\n💡 Tip: Use 'python createTask.py list' to see all tasks with numbers")
-                print(f"   Then use: python createTask.py complete <number>")
-                return
-            
-            # 5. If multiple matches, show them and require selection
-            if len(matching_tasks) > 1:
-                print(f"⚠️  Found {len(matching_tasks)} matching tasks:\n")
-                for i, task in enumerate(matching_tasks, 1):
-                    title = task.get("title", "(No title)")
-                    due = task.get("due", "")
-                    due_str = ""
-                    if due:
-                        try:
-                            due_date = due.split("T")[0]
-                            due_str = f" | Due: {due_date}"
-                        except:
-                            pass
-                    print(f"   {i}. {title}{due_str}")
-                print(f"\n❌ Multiple matches found. Please be more specific:")
-                print(f"   - Use the task number: python createTask.py complete <number>")
-                print(f"   - Use more of the title: python createTask.py complete 'full task title'")
-                print(f"   - Use the task ID: python createTask.py complete <task-id>")
-                return
-            
-            # Single match found
-            task_to_complete = matching_tasks[0]
-            task_id = task_to_complete.get("id")
-            task_title_actual = task_to_complete.get("title", "(No title)")
-        
-        # 6. Get the existing task first to preserve all fields
-        existing_task = service.tasks().get(
-            tasklist=task_list_id,
-            task=task_id
-        ).execute()
-        
-        # 7. Update the task with all existing fields plus status change
-        updated_task = existing_task.copy()
-        updated_task["status"] = "completed"
-        
-        result = service.tasks().update(
-            tasklist=task_list_id,
-            task=task_id,
-            body=updated_task
-        ).execute()
-        
-        print(f"✅ Task completed: {result.get('title', task_title_actual)}")
-        
-    except HttpError as err:
-        print(f"❌ An HTTP error occurred: {err}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-        sys.exit(1)
+# ---------------------------------------------------------------------------
+# Alfred output
+# ---------------------------------------------------------------------------
 
-def delete_task(task_identifier):
-    """
-    Deletes a task by ID or by matching title/number.
-    Can match by:
-    - Task ID (if it looks like an ID)
-    - Task title (partial match, case-insensitive)
-    - Task number from list (if numeric)
-    """
-    
-    try:
-        service = get_google_service()
-        
-        # 1. Determine the task list ID (use the default primary list)
-        task_lists = service.tasklists().list(maxResults=1).execute()
-        task_list_id = task_lists.get("items", [{}])[0].get("id", "@default")
-        
-        # 2. Check if identifier looks like a task ID (long alphanumeric string)
-        if len(task_identifier) > 20 and task_identifier.replace('_', '').replace('-', '').isalnum():
-            # Looks like a task ID, try to delete it directly
-            try:
-                # First, try to get the task to show what we're deleting
-                task = service.tasks().get(tasklist=task_list_id, task=task_identifier).execute()
-                task_title = task.get("title", "(No title)")
-                
-                # Delete the task
-                service.tasks().delete(tasklist=task_list_id, task=task_identifier).execute()
-                print(f"🗑️️ Task deleted: {task_title}")
-                return
-            except HttpError as err:
-                if err.resp.status == 404:
-                    print(f"❌ Task ID not found: {task_identifier}")
-                else:
-                    print(f"❌ Error deleting task: {err}")
-                sys.exit(1)
-        
-        # 3. Check if identifier is a number (for selecting from list)
-        if task_identifier.isdigit():
-            # Get all tasks (including completed for deletion)
-            tasks_result = service.tasks().list(
-                tasklist=task_list_id,
-                showCompleted=True,
-                maxResults=100
-            ).execute()
-            tasks = tasks_result.get("items", [])
-            
-            task_num = int(task_identifier)
-            if task_num < 1 or task_num > len(tasks):
-                print(f"❌ Task number {task_num} is out of range (1-{len(tasks)})")
-                return
-            
-            task_to_delete = tasks[task_num - 1]
-            task_id = task_to_delete.get("id")
-            task_title_actual = task_to_delete.get("title", "(No title)")
-        else:
-            # 4. Search by title (case-insensitive, partial match)
-            tasks_result = service.tasks().list(
-                tasklist=task_list_id,
-                showCompleted=True,  # Include completed tasks for deletion
-                maxResults=100
-            ).execute()
-            
-            tasks = tasks_result.get("items", [])
-            
-            # Find matching tasks
-            matching_tasks = []
-            task_title_lower = task_identifier.lower()
-            
-            for task in tasks:
-                task_title_from_api = task.get("title", "").lower()
-                if task_title_lower in task_title_from_api or task_title_from_api in task_title_lower:
-                    matching_tasks.append(task)
-            
-            if not matching_tasks:
-                print(f"❌ No task found matching '{task_identifier}'")
-                return
-            
-            # 5. If multiple matches, show them and require selection
-            if len(matching_tasks) > 1:
-                print(f"⚠️  Found {len(matching_tasks)} matching tasks:\n")
-                for i, task in enumerate(matching_tasks, 1):
-                    title = task.get("title", "(No title)")
-                    status = task.get("status", "")
-                    due = task.get("due", "")
-                    status_icon = "✅" if status == "completed" else "⏳"
-                    due_str = ""
-                    if due:
-                        try:
-                            due_date = due.split("T")[0]
-                            due_str = f" | Due: {due_date}"
-                        except:
-                            pass
-                    print(f"   {i}. {status_icon} {title}{due_str}")
-                print(f"\n❌ Multiple matches found. Please be more specific:")
-                print(f"   - Use the task number: python createTask.py delete <number>")
-                print(f"   - Use more of the title: python createTask.py delete 'full task title'")
-                print(f"   - Use the task ID: python createTask.py delete <task-id>")
-                return
-            
-            # Single match found
-            task_to_delete = matching_tasks[0]
-            task_id = task_to_delete.get("id")
-            task_title_actual = task_to_delete.get("title", "(No title)")
-        
-        # 6. Delete the task
-        service.tasks().delete(tasklist=task_list_id, task=task_id).execute()
-        print(f"❌️ Task deleted: {task_title_actual}")
-        
-    except HttpError as err:
-        print(f"❌ An HTTP error occurred: {err}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-        sys.exit(1)
+def alfred(items):
+    print(json.dumps({"items": items}))
 
-def parse_task_input_to_alfred(user_input):
-    """
-    Parses user input for task creation and returns Alfred JSON format.
-    
-    Args:
-        user_input: String like "Buy groceries 12-30:15:30"
-    
-    Returns:
-        Alfred JSON with:
-        - title: Cleaned task title (without date)
-        - subtitle: Due date if specified
-        - arg: JSON string with task data (title, due_datetime, etc.)
-    """
-    import json
-    
-    # Parse the input string
-    task_title, due_datetime = parse_date_from_string(user_input)
-    
-    # Build subtitle with due date info
-    subtitle = "No due date"
-    if due_datetime:
-        # Format the due date nicely
-        if due_datetime.hour != 0 or due_datetime.minute != 0:
-            # Has time - include it in subtitle
-            time_str = f"{due_datetime.hour:02d}:{due_datetime.minute:02d}"
-            due_date_str = due_datetime.strftime("%Y-%m-%d")
-            subtitle = f"📆 Due: {due_date_str} at {time_str}"
-        else:
-            # Just date
-            due_date_str = due_datetime.strftime("%Y-%m-%d")
-            # Check if it's a relative date
-            now = datetime.datetime.now()
-            if due_datetime.date() == now.date():
-                subtitle = "📅 Due: today"
-            elif due_datetime.date() == (now + datetime.timedelta(days=1)).date():
-                subtitle = "📅 Due: tomorrow"
-            else:
-                subtitle = f"📅 Due: {due_date_str}"
-    
-    # Build argument JSON with all task creation data
-    task_data = {
-        "title": task_title.strip() if task_title else "",
-        "due_datetime": due_datetime.isoformat() if due_datetime else None,
-        "has_time": due_datetime and (due_datetime.hour != 0 or due_datetime.minute != 0) if due_datetime else False
-    }
-    
-    # Create Alfred item
-    alfred_item = {
-        "uid": "new_task",
-        "title": task_title.strip() if task_title else "(No title)",
-        "subtitle": subtitle,
-        "arg": json.dumps(task_data),
-        "valid": True if task_title and task_title.strip() else False,
-        "icon": {
-            "path": "icon.png"
-        }
-    }
-    
-    # Output Alfred JSON format
-    alfred_output = {
-        "items": [alfred_item]
-    }
-    
-    print(json.dumps(alfred_output, indent=2))
 
-def output_alfred_items(tasks_json):
-    """
-    Converts task list JSON to Alfred script filter format.
-    Takes JSON string or dict from list_tasks() and outputs Alfred items.
-    """
-    import json
-    
-    # Parse JSON if it's a string
-    if isinstance(tasks_json, str):
-        data = json.loads(tasks_json)
+def alfred_message(title, subtitle="", arg=None):
+    item = {"title": title, "subtitle": subtitle, "valid": arg is not None}
+    if arg is not None:
+        item["arg"] = arg
+    alfred([item])
+
+
+def alfred_parse(text):
+    """Script Filter: preview the task to be created. ⌥↩ creates it with no date parsing."""
+    text = text.strip()
+    if not text:
+        return alfred([{"title": "Type a task…", "subtitle": "e.g. 'Call the plumber tomorrow'",
+                        "valid": False}])
+    title, due = parse_date_from_string(text)
+    if due is None:
+        subtitle = "No due date"
+    elif _has_time(due):
+        subtitle = f"📆 Due: {due:%Y-%m-%d} at {due:%H:%M}"
+    elif due.date() == datetime.date.today():
+        subtitle = "📅 Due: today"
+    elif due.date() == datetime.date.today() + datetime.timedelta(days=1):
+        subtitle = "📅 Due: tomorrow"
     else:
-        data = tasks_json
-    
-    # Extract tasks
-    tasks = data.get("tasks", [])
-    
-    # Build Alfred items
-    alfred_items = []
-    
-    for task in tasks:
-        task_id = task.get("id", "")
-        title = task.get("title", "(No title)")
-        status = task.get("status", "")
-        due = task.get("due", "")
-        notes = task.get("notes", "")
-        
-        # Format subtitle with status and due date
-        subtitle_parts = []
-        
-        # Status
-        if status == "completed":
-            subtitle_parts.append("✅ Completed")
-        else:
-            subtitle_parts.append("⏳ Pending")
-        
-        # Due date
-        if due:
-            try:
-                # Parse the due date (format: 2025-12-30T00:00:00.000Z)
-                due_date = due.split("T")[0]
-                subtitle_parts.append(f"Due: {due_date}")
-            except:
-                subtitle_parts.append(f"Due: {due}")
-        
-        # Notes preview (first line, truncated)
-        if notes:
-            notes_preview = notes.split("\n")[0]
-            if len(notes_preview) > 50:
-                notes_preview = notes_preview[:47] + "..."
-            subtitle_parts.append(notes_preview)
-        
-        subtitle = " | ".join(subtitle_parts) if subtitle_parts else "No details"
-        
-        # Create Alfred item
-        item = {
-            "uid": task_id,  # Unique identifier
-            "title": title,
-            "subtitle": subtitle,
-            "arg": task_id,  # Task ID passed as argument
+        subtitle = f"📅 Due: {due:%Y-%m-%d}"
+    alfred([{
+        "uid": "new_task",
+        "title": title or "(No title)",
+        "subtitle": subtitle,
+        "arg": json.dumps({"title": title, "due_datetime": due.isoformat() if due else None}),
+        "valid": bool(title),
+        "icon": {"path": "icon.png"},
+        "mods": {"alt": {
             "valid": True,
-            "icon": {
-                "path": "icon.png" if status != "completed" else "checklist.png"
-            }
-        }
-        
-        alfred_items.append(item)
-    
-    # Output Alfred JSON format
-    alfred_output = {
-        "items": alfred_items
-    }
-    
-    print(json.dumps(alfred_output, indent=2))
+            "arg": json.dumps({"title": text, "due_datetime": None}),
+            "subtitle": f"Create “{text}” exactly as typed, with no due date",
+        }},
+    }])
+
+
+def alfred_list():
+    """Script Filter: open tasks. Always prints valid Alfred JSON, errors included."""
+    try:
+        tasks = fetch_tasks(interactive=False)
+    except AuthRequired as err:
+        return alfred_message(str(err), "Opens your browser to authorize gTasks", arg="auth")
+    except ConfigError as err:
+        return alfred_message(str(err), "Alfred Preferences → Workflows → gTask → Configure Workflow")
+    except WorkflowError as err:
+        return alfred_message("Couldn't load your tasks", str(err))
+    if not tasks:
+        return alfred_message("No open tasks 🎉")
+
+    items = []
+    for task in tasks:
+        parts = ["✅ Completed" if task.get("status") == "completed" else "⏳ Pending"]
+        if task.get("due"):
+            parts.append(f"Due: {due_date(task)}")
+        notes = task.get("notes", "").split("\n")[0]
+        if notes:
+            parts.append(notes if len(notes) <= 50 else notes[:47] + "...")
+        items.append({
+            "uid": task["id"],
+            "title": task.get("title") or "(No title)",
+            "subtitle": " | ".join(parts),
+            # Plain ↩ is reserved for the sign-in item; tasks act on ⌘↩ / ⌘⌥↩ only.
+            "valid": False,
+            "mods": {
+                "cmd": {"valid": True, "arg": task["id"], "subtitle": "✅️ Complete this task"},
+                "cmd+alt": {"valid": True, "arg": task["id"], "subtitle": "Delete this task 🗑️"},
+            },
+            "icon": {"path": "checklist.png" if task.get("status") == "completed" else "icon.png"},
+        })
+    alfred(items)
+
+
+def print_list(show_completed, as_json):
+    tasks = fetch_tasks(interactive=True, show_completed=show_completed)
+    if as_json:
+        print(json.dumps({"task_list_id": TASKLIST, "count": len(tasks), "tasks": tasks}, indent=2))
+        return
+    if not tasks:
+        print("No tasks found.")
+        return
+    for i, task in enumerate(tasks, 1):
+        icon = "✅" if task.get("status") == "completed" else "⏳"
+        due = f" | Due: {due_date(task)}" if task.get("due") else ""
+        print(f"{i}. {icon} {task.get('title') or '(No title)'}{due}")
+
+
+def create_from_json(raw):
+    try:
+        data = json.loads(raw)
+        title = data.get("title", "").strip()
+        due = data.get("due_datetime")
+        due = datetime.datetime.fromisoformat(due) if due else None
+    except (ValueError, AttributeError) as err:
+        raise WorkflowError(f"Invalid task data: {err}")
+    if not title:
+        raise WorkflowError("Task title is required")
+    return create_task(title, due)
+
+
+def create_from_text(text):
+    title, due = parse_date_from_string(text)
+    if not title:
+        raise WorkflowError("Task title cannot be empty after removing the date")
+    return create_task(title, due)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+USAGE = """Usage:
+  createTask.py 'Task title [date]'           create a task
+  createTask.py list [--completed] [--json]   list tasks
+  createTask.py complete <id|title|number>
+  createTask.py delete <id|title|number>
+  createTask.py auth                          sign in to Google
+Dates: today, tomorrow, monday, next friday, next week, in 3 days, 2026-12-03,
+       and 12-15 or 12/15 as the last word; add :hh:mm for a time (e.g. 12-15:09:30)."""
+
+
+def main(argv):
+    if not argv:
+        print(USAGE)
+        return 1
+    cmd, rest = argv[0].lower(), " ".join(argv[1:])
+
+    # Script Filters: always exit 0 with Alfred JSON.
+    if cmd in ("parse", "--parse", "-p"):
+        alfred_parse(rest)
+        return 0
+    if cmd in ("list", "--list", "-l") and ("--alfred" in argv or "-a" in argv):
+        alfred_list()
+        return 0
+
+    # Actions / CLI: one line of output (the Alfred notification text).
+    try:
+        if cmd in ("list", "--list", "-l"):
+            print_list("--completed" in argv or "-c" in argv, "--json" in argv or "-j" in argv)
+            return 0
+        if cmd == "auth":
+            authorize()
+            message = "🔑 Signed in to Google Tasks"
+        elif cmd in ("create", "--create"):
+            message = create_from_json(rest)
+        elif cmd in ("complete", "done", "--complete", "--done"):
+            message = complete_task(rest.strip()) if rest.strip() else None
+        elif cmd in ("delete", "remove", "--delete", "--remove", "-d"):
+            message = delete_task(rest.strip()) if rest.strip() else None
+        else:
+            message = create_from_text(" ".join(argv))
+        if message is None:
+            print(USAGE)
+            return 1
+        print(message)
+        return 0
+    except WorkflowError as err:
+        log(f"{type(err).__name__}: {err}")
+        print(f"❌ {err}")
+    except Exception as err:  # never leave Alfred with no feedback
+        log(f"Unexpected error: {err!r}")
+        print(f"❌ Unexpected error: {err}")
+    # Under Alfred, exit 0 so the error message still reaches the notification.
+    return 0 if UNDER_ALFRED else 1
+
 
 if __name__ == "__main__":
-    # Check for parse command (for Alfred input preview)
-    if len(sys.argv) > 1 and sys.argv[1].lower() in ['parse', '--parse', '-p']:
-        # Parse user input and output Alfred format
-        if len(sys.argv) < 3:
-            # No input provided, show empty result
-            import json
-            alfred_output = {
-                "items": [{
-                    "uid": "empty",
-                    "title": "Type a task...",
-                    "subtitle": "e.g., 'Buy groceries 12-30:15:30'",
-                    "valid": False
-                }]
-            }
-            print(json.dumps(alfred_output, indent=2))
-        else:
-            input_string = " ".join(sys.argv[2:])
-            parse_task_input_to_alfred(input_string)
-    # Check for list command
-    elif len(sys.argv) > 1 and sys.argv[1].lower() in ['list', '--list', '-l']:
-        # List tasks
-        show_completed = '--completed' in sys.argv or '-c' in sys.argv
-        json_output = '--json' in sys.argv or '-j' in sys.argv
-        alfred_output = '--alfred' in sys.argv or '-a' in sys.argv
-        
-        if alfred_output:
-            # Get tasks as JSON and convert to Alfred format
-            import json
-            import io
-            import contextlib
-            
-            # Capture the JSON output
-            f = io.StringIO()
-            with contextlib.redirect_stdout(f):
-                list_tasks(show_completed=show_completed, json_output=True)
-            tasks_json = f.getvalue()
-            
-            # Convert to Alfred format
-            output_alfred_items(tasks_json)
-        else:
-            list_tasks(show_completed=show_completed, json_output=json_output)
-    # Check for complete command
-    elif len(sys.argv) > 1 and sys.argv[1].lower() in ['complete', 'done', '--complete', '--done']:
-        # Complete a task
-        if len(sys.argv) < 3:
-            print("❌ ERROR: Please provide a task identifier to complete.")
-            print("Usage: python createTask.py complete 'Task title' or <task-id> or <number>")
-            sys.exit(1)
-        task_identifier = " ".join(sys.argv[2:])
-        complete_task(task_identifier)
-    # Check for delete command
-    elif len(sys.argv) > 1 and sys.argv[1].lower() in ['delete', 'remove', '--delete', '--remove', '-d']:
-        # Delete a task
-        if len(sys.argv) < 3:
-            print("❌ ERROR: Please provide a task identifier to delete.")
-            print("Usage: python createTask.py delete 'Task title' or <task-id> or <number>")
-            sys.exit(1)
-        task_identifier = " ".join(sys.argv[2:])
-        delete_task(task_identifier)
-    # Check for create from JSON command
-    elif len(sys.argv) > 1 and sys.argv[1].lower() in ['create', '--create', '-c']:
-        # Create task from JSON (from Alfred parse output)
-        if len(sys.argv) < 3:
-            print("❌ ERROR: Please provide JSON task data.")
-            print("Usage: python createTask.py create '{\"title\": \"Task\", \"due_datetime\": \"...\"}'")
-            sys.exit(1)
-        import json
-        try:
-            # Join all arguments after 'create' in case JSON has spaces
-            json_str = " ".join(sys.argv[2:])
-            task_data = json.loads(json_str)
-            
-            # Extract task data
-            task_title = task_data.get("title", "")
-            due_datetime_str = task_data.get("due_datetime")
-            
-            # Parse due_datetime if provided
-            due_datetime = None
-            if due_datetime_str:
-                try:
-                    due_datetime = datetime.datetime.fromisoformat(due_datetime_str.replace('Z', '+00:00'))
-                    # Convert to local time if it has timezone
-                    if due_datetime.tzinfo:
-                        due_datetime = due_datetime.astimezone().replace(tzinfo=None)
-                except:
-                    # Try parsing as ISO format
-                    try:
-                        due_datetime = datetime.datetime.fromisoformat(due_datetime_str)
-                    except:
-                        print(f"⚠️  Warning: Could not parse due_datetime: {due_datetime_str}")
-            
-            if not task_title:
-                print("❌ ERROR: Task title is required in JSON data.")
-                sys.exit(1)
-            
-            # Create the task
-            add_task(task_title, due_datetime)
-        except json.JSONDecodeError as e:
-            print(f"❌ ERROR: Invalid JSON: {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"❌ ERROR: {e}")
-            sys.exit(1)
-    elif len(sys.argv) > 1:
-        # Create a task
-        input_string = " ".join(sys.argv[1:])  # Join all arguments in case title has spaces
-        
-        # Parse date from input string
-        task_title, due_datetime = parse_date_from_string(input_string)
-        
-        if not task_title or not task_title.strip():
-            print("❌ ERROR: Task title cannot be empty after removing date.")
-            print("Usage: python createTask.py 'Your task title here [date]'")
-            sys.exit(1)
-        
-        # Add the task
-        add_task(task_title.strip(), due_datetime)
-    else:
-        print("❌ ERROR: Please provide a task title as an argument.")
-        print("\nUsage:")
-        print("  Create task:    python createTask.py 'Your task title here [date]'")
-        print("  Create from JSON: python createTask.py create '{\"title\": \"Task\", ...}'")
-        print("  Parse input:    python createTask.py parse 'Task title [date]'")
-        print("  List tasks:     python createTask.py list")
-        print("  List all:       python createTask.py list --completed")
-        print("  List JSON:      python createTask.py list --json")
-        print("  List Alfred:    python createTask.py list --alfred")
-        print("  Complete:       python createTask.py complete 'Task title' or <task-id> or <number>")
-        print("  Delete:         python createTask.py delete 'Task title' or <task-id> or <number>")
-        print("\nDate formats supported:")
-        print("  - mm-dd (e.g., 11-23)")
-        print("  - yyyy-mm-dd (e.g., 2025-12-03)")
-        print("  - mm-dd:hh:mm (e.g., 11-23:23:30)")
-        print("  - today, tomorrow")
-        print("  - next monday, next tuesday, etc.")
-        print("  - monday, tuesday, etc. (next occurrence)")
-        sys.exit(1)
+    sys.exit(main(sys.argv[1:]))
