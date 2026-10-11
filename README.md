@@ -85,6 +85,8 @@ The tests run offline against a fake Google server.
 
 ## 🧰 Changelog
 
+- 2026-10-11: version 0.2.1 — filled in the workflow's About panel (usage, due dates, setup)
+  and its configuration descriptions; the workflow is now named **gTasks ✅**.
 - 2026-10-06: version 0.2.0
   - **No dependencies.** The workflow now uses only the standard library, so it runs on the
     system Python with nothing to `pip install`. 0.1.x failed on any Mac without the Google

@@ -5,7 +5,7 @@
 	<key>bundleid</key>
 	<string>giovanni-gTasks</string>
 	<key>category</key>
-	<string>WIP</string>
+	<string>Productivity</string>
 	<key>connections</key>
 	<dict>
 		<key>6286DB17-C84B-4F43-8290-B1C0F928C7AB</key>
@@ -133,13 +133,36 @@
 	<key>createdby</key>
 	<string>giovanni</string>
 	<key>description</key>
-	<string>Create a new Google Task</string>
+	<string>Create and manage Google Tasks with Alfred</string>
 	<key>disabled</key>
 	<false/>
 	<key>name</key>
-	<string>gTask</string>
+	<string>gTasks ✅</string>
 	<key>objects</key>
 	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>script</key>
+				<string>/usr/bin/python3 createTask.py auth</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>11</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>E239F66B-787A-42C9-A5AC-3D8542DFECE8</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
 		<dict>
 			<key>config</key>
 			<dict>
@@ -369,32 +392,48 @@
 			<key>version</key>
 			<integer>2</integer>
 		</dict>
-		<dict>
-			<key>config</key>
-			<dict>
-				<key>concurrently</key>
-				<false/>
-				<key>escaping</key>
-				<integer>102</integer>
-				<key>script</key>
-				<string>/usr/bin/python3 createTask.py auth</string>
-				<key>scriptargtype</key>
-				<integer>1</integer>
-				<key>scriptfile</key>
-				<string></string>
-				<key>type</key>
-				<integer>11</integer>
-			</dict>
-			<key>type</key>
-			<string>alfred.workflow.action.script</string>
-			<key>uid</key>
-			<string>E239F66B-787A-42C9-A5AC-3D8542DFECE8</string>
-			<key>version</key>
-			<integer>2</integer>
-		</dict>
 	</array>
 	<key>readme</key>
-	<string># gtasks</string>
+	<string># gTasks ✅
+
+Create and manage Google Tasks with Alfred.
+
+More info: https://github.com/giovannicoppola/alfred-gtasks
+
+## Usage
+Type `gt_new` (configurable) followed by the task and an optional due date, e.g. `gt_new Call the plumber tomorrow`. The subtitle shows the due date before you press `Enter`.
+
+- `Enter`: create the task
+- `⌥`: create the task exactly as typed, with no due date
+
+Type `gt_tasks` (configurable) to list your open tasks. On any result:
+
+- `⌘`: mark as complete
+- `⌘⌥`: delete
+
+## Due dates
+`today`, `tomorrow`, `friday`, `next friday`, `next week`, `next month`, `in 3 days|weeks|months`, `2026-12-03`, or `12/15` (or `12-15`) as the last word.
+
+Add a time with `:hh:mm`, e.g. `12-15:09:30`. Google Tasks stores only the date, so the time is added to the task title.
+
+## Setting up
+gTasks needs your own (free) Google OAuth client:
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), enable the **Google Tasks API**, set up the **OAuth consent screen** (External) and add your Google account as a **test user**.
+2. Under **Credentials**, create an **OAuth client ID** of type *Desktop app* and download the JSON.
+3. Select that file as **Key File** below.
+4. Type `gt_tasks` and press `Enter` on *Sign in to Google*.
+
+While the consent screen is in *Testing*, Google asks you to sign in again every 7 days. Set its publishing status to *In production* to avoid that.
+
+## What's new in 0.2
+- 📦 Nothing to install: runs on the macOS system Python
+- 🔑 Sign-in problems now show in Alfred, with `Enter` to sign in again
+- 📅 Better due-date parsing, and `⌥` to skip it
+
+## Feedback
+Bug reports and ideas are welcome on [GitHub](https://github.com/giovannicoppola/alfred-gtasks/issues) or the [Alfred forum](https://www.alfredforum.com/).
+</string>
 	<key>uidata</key>
 	<dict>
 		<key>6286DB17-C84B-4F43-8290-B1C0F928C7AB</key>
@@ -469,9 +508,9 @@
 				<true/>
 			</dict>
 			<key>description</key>
-			<string></string>
+			<string>Keyword to create a task</string>
 			<key>label</key>
-			<string>Create a new task</string>
+			<string>New task keyword</string>
 			<key>type</key>
 			<string>textfield</string>
 			<key>variable</key>
@@ -490,9 +529,9 @@
 				<true/>
 			</dict>
 			<key>description</key>
-			<string></string>
+			<string>Keyword to list, complete, or delete your tasks</string>
 			<key>label</key>
-			<string>List my tasks</string>
+			<string>Task list keyword</string>
 			<key>type</key>
 			<string>textfield</string>
 			<key>variable</key>
@@ -511,7 +550,7 @@
 				<true/>
 			</dict>
 			<key>description</key>
-			<string>OAuth client ID JSON (type 'Desktop app') from Google Cloud Console — see 'Setting up'. Only needed to sign in.</string>
+			<string>OAuth client ID JSON (Desktop app) from the Google Cloud Console. Only needed to sign in — see Setting up above.</string>
 			<key>label</key>
 			<string>Key File</string>
 			<key>type</key>
@@ -521,8 +560,8 @@
 		</dict>
 	</array>
 	<key>version</key>
-	<string>0.2.0</string>
+	<string>0.2.1</string>
 	<key>webaddress</key>
-	<string>https://github.com/giovannicoppola/alfred-gTasks</string>
+	<string>https://github.com/giovannicoppola/alfred-gtasks</string>
 </dict>
 </plist>

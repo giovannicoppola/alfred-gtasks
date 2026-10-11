@@ -664,7 +664,7 @@ def alfred_list():
     except AuthRequired as err:
         return alfred_message(str(err), "Opens your browser to authorize gTasks", arg="auth")
     except ConfigError as err:
-        return alfred_message(str(err), "Alfred Preferences → Workflows → gTask → Configure Workflow")
+        return alfred_message(str(err), "Alfred Preferences → Workflows → gTasks → Configure Workflow")
     except WorkflowError as err:
         return alfred_message("Couldn't load your tasks", str(err))
     if not tasks:
